@@ -1,432 +1,505 @@
-import 'dart:async';
-import 'dart:io';
 import 'dart:typed_data';
-import 'package:permission_handler/permission_handler.dart';
-import '../models/vmc_protocol_models.dart';
+import 'dart:typed_data';
 
-/// Modern Bluetooth service using platform channels and socket communication
-class ModernVMCBluetoothService {
-  Socket? _socket;
-  StreamSubscription<Uint8List>? _dataSubscription;
-  final StreamController<VMCResponse> _responseController = 
-      StreamController<VMCResponse>.broadcast();
+/// VMC Protocol Constants
+class VMCProtocol {
+  // Frame sizes
+  static const int commandFrameSize = 6;
+  static const int responseFrameSize = 5;
   
-  final List<int> _buffer = [];
-  Timer? _responseTimeout;
-  Completer<VMCResponse>? _pendingResponse;
+  // Response status codes
+  static const int statusNormal = 0x5D;
+  static const int statusAbnormal = 0x5C;
   
-  // Bluetooth device info
-  String? _connectedDeviceAddress;
-  String? _connectedDeviceName;
+  // Product delivery flags
+  static const int noProductDelivery = 0x00;
+  static const int productDelivered = 0xAA;
   
-  bool get isConnected => _socket != null;
+  // Command codes
+  static const int cmdDispenseStart = 0x01;
+  static const int cmdDispenseEnd = 0x50;
+  static const int cmdSelfCheck = 0x64;
+  static const int cmdSlotReset = 0x65;
+  static const int cmdSetBeltSlot = 0x68;
+  static const int cmdSetSpiralSlot = 0x74;
+  static const int cmdSetAllSpiralSlots = 0x75;
+  static const int cmdSetAllBeltSlots = 0x76;
+  static const int cmdQuerySlotStart = 0x79;
+  static const int cmdQuerySlotEnd = 0xC8;
+  static const int cmdSetSingleSlot = 0xC9;
+  static const int cmdSetDualSlot = 0xCA;
+  static const int cmdSetAllSingleSlots = 0xCB;
+  static const int cmdTemperatureControl = 0xCC;
+  static const int cmdTemperatureMode = 0xCD;
+  static const int cmdSetTargetTemperature = 0xCE;
+  static const int cmdSetTempReturnDiff = 0xCF;
+  static const int cmdSetTempCompensation = 0xD0;
+  static const int cmdSetDefrostTime = 0xD1;
+  static const int cmdSetWorkingTime = 0xD2;
+  static const int cmdSetDowntime = 0xD3;
+  static const int cmdGlassHeating = 0xD4;
+  static const int cmdReadTemperature = 0xDC;
+  static const int cmdLightingControl = 0xDD;
+  static const int cmdDoorStatus = 0xDF;
   
-  Stream<VMCResponse> get responseStream => _responseController.stream;
+  // Drop sensor flags
+  static const int withoutDropSensor = 0x55;
+  static const int withDropSensor = 0xAA;
   
-  /// Request necessary permissions for Bluetooth
-  Future<bool> requestPermissions() async {
-    if (Platform.isAndroid) {
-      final permissions = <Permission>[
-        Permission.bluetoothConnect,
-        Permission.bluetoothScan,
-        Permission.bluetoothAdvertise,
-        Permission.location,
-        Permission.locationWhenInUse,
-      ];
-      
-      final statuses = await permissions.request();
-      
-      // Check if all permissions are granted
-      return statuses.values.every((status) => 
-        status == PermissionStatus.granted || 
-        status == PermissionStatus.limited
-      );
+  // Temperature control flags
+  static const int tempControlDisabled = 0x00;
+  static const int tempControlEnabled = 0x01;
+  static const int heatingMode = 0x00;
+  static const int coolingMode = 0x01;
+  
+  // Lighting control flags
+  static const int lightOff = 0x55;
+  static const int lightOn = 0xAA;
+  
+  // Glass heating flags
+  static const int glassHeatingOff = 0x00;
+  static const int glassHeatingOn = 0x01;
+}
+
+/// Base class for all VMC commands
+abstract class VMCCommand {
+  final int driverBoardNumber;
+  
+  const VMCCommand({required this.driverBoardNumber});
+  
+  /// Generate the 6-byte command frame according to protocol
+  Uint8List generateFrame();
+  
+  /// Validate command parameters
+  bool validate();
+  
+  /// Get expected response timeout
+  Duration get timeout => const Duration(seconds: 5);
+}
+
+/// VMC Response class for parsing driver board responses
+class VMCResponse {
+  final int driverBoardNumber;
+  final bool isSuccess;
+  final int errorCode;
+  final int productFlag;
+  final int checksum;
+  final bool isChecksumValid;
+  
+  const VMCResponse({
+    required this.driverBoardNumber,
+    required this.isSuccess,
+    required this.errorCode,
+    required this.productFlag,
+    required this.checksum,
+    required this.isChecksumValid,
+  });
+  
+  factory VMCResponse.fromBytes(Uint8List bytes) {
+    if (bytes.length != VMCProtocol.responseFrameSize) {
+      throw ArgumentError('Response must be exactly ${VMCProtocol.responseFrameSize} bytes');
     }
-    return true; // iOS handles permissions automatically
-  }
-  
-  /// Get list of paired Bluetooth devices using platform channels
-  Future<List<BluetoothDeviceInfo>> getPairedDevices() async {
-    try {
-      if (Platform.isAndroid) {
-        // Use Android specific implementation
-        return await _getAndroidPairedDevices();
-      } else {
-        // iOS implementation would go here
-        return [];
-      }
-    } catch (e) {
-      print('Error getting paired devices: $e');
-      return [];
-    }
-  }
-  
-  /// Android specific method to get paired devices
-  Future<List<BluetoothDeviceInfo>> _getAndroidPairedDevices() async {
-    // This would use platform channels to get paired devices
-    // For now, returning mock data for demonstration
-    return [
-      BluetoothDeviceInfo(
-        name: 'HC-06',
-        address: '00:11:22:33:44:55',
-        isConnected: false,
-      ),
-      BluetoothDeviceInfo(
-        name: 'linvor',
-        address: '00:11:22:33:44:56',
-        isConnected: false,
-      ),
-    ];
-  }
-  
-  /// Connect to Bluetooth device using Socket
-  Future<bool> connect(BluetoothDeviceInfo device) async {
-    try {
-      // Close existing connection if any
-      await disconnect();
-      
-      // Request permissions first
-      final hasPermissions = await requestPermissions();
-      if (!hasPermissions) {
-        throw Exception('Bluetooth permissions not granted');
-      }
-      
-      // For HC-06, we'll use RFCOMM socket connection
-      // This is a simplified implementation - actual implementation would use platform channels
-      _socket = await _connectToDevice(device.address);
-      
-      if (_socket != null) {
-        _connectedDeviceAddress = device.address;
-        _connectedDeviceName = device.name;
-        _setupDataListener();
-        return true;
-      }
-      return false;
-    } catch (e) {
-      print('Error connecting to device: $e');
-      return false;
-    }
-  }
-  
-  /// Platform-specific socket connection
-  Future<Socket?> _connectToDevice(String address) async {
-    try {
-      // This is a mock implementation
-      // Real implementation would use platform channels to create RFCOMM socket
-      
-      // For demonstration, we'll simulate a connection
-      await Future.delayed(const Duration(seconds: 2));
-      
-      // Create a mock socket-like connection
-      return await Socket.connect('127.0.0.1', 8080).catchError((e) {
-        // If local connection fails, create a mock successful connection
-        return _createMockSocket();
-      });
-    } catch (e) {
-      print('Socket connection error: $e');
-      return null;
-    }
-  }
-  
-  /// Create a mock socket for demonstration
-  Socket _createMockSocket() {
-    // This is for demonstration purposes
-    // Real implementation would return actual RFCOMM socket
-    throw UnimplementedError('Mock socket - replace with actual RFCOMM connection');
-  }
-  
-  /// Disconnect from the device
-  Future<void> disconnect() async {
-    try {
-      _cancelPendingResponse();
-      await _dataSubscription?.cancel();
-      await _socket?.close();
-      _socket = null;
-      _connectedDeviceAddress = null;
-      _connectedDeviceName = null;
-      _buffer.clear();
-    } catch (e) {
-      print('Error disconnecting: $e');
-    }
-  }
-  
-  /// Setup listener for incoming data from VMC
-  void _setupDataListener() {
-    _dataSubscription = _socket?.listen(
-      (Uint8List data) {
-        _processIncomingData(data);
-      },
-      onError: (error) {
-        print('Socket data error: $error');
-        _handleConnectionError();
-      },
-      onDone: () {
-        print('Socket connection closed');
-        _handleConnectionError();
-      },
+    
+    final r1 = bytes[0]; // Driver board number
+    final r2 = bytes[1]; // Error code (0x5D normal, 0x5C abnormal)
+    final r3 = bytes[2]; // Error parsing code
+    final r4 = bytes[3]; // Product delivery flag
+    final r5 = bytes[4]; // Checksum
+    
+    // Verify checksum: R5 = (R1 + R2 + R3 + R4) & 0xFF
+    final calculatedChecksum = (r1 + r2 + r3 + r4) & 0xFF;
+    final isChecksumValid = calculatedChecksum == r5;
+    
+    return VMCResponse(
+      driverBoardNumber: r1,
+      isSuccess: r2 == VMCProtocol.statusNormal,
+      errorCode: r3,
+      productFlag: r4,
+      checksum: r5,
+      isChecksumValid: isChecksumValid,
     );
   }
   
-  /// Process incoming data and parse VMC responses
-  void _processIncomingData(Uint8List data) {
-    _buffer.addAll(data);
+  bool get hasProductDelivery => productFlag == VMCProtocol.productDelivered;
+  
+  String get errorDescription {
+    if (isSuccess) return 'Operation successful';
     
-    // Try to parse complete response frames
-    while (_buffer.length >= VMCProtocol.responseFrameSize) {
-      final frameBytes = Uint8List.fromList(
-        _buffer.take(VMCProtocol.responseFrameSize).toList()
-      );
-      
-      try {
-        final response = VMCResponse.fromBytes(frameBytes);
-        
-        // Validate checksum
-        if (response.isChecksumValid) {
-          _handleValidResponse(response);
-          _buffer.removeRange(0, VMCProtocol.responseFrameSize);
-        } else {
-          // Invalid checksum, try shifting by one byte
-          _buffer.removeAt(0);
-          print('Invalid checksum, shifting buffer');
-        }
-      } catch (e) {
-        // Parsing failed, try shifting by one byte
-        _buffer.removeAt(0);
-        print('Frame parsing failed: $e');
-      }
+    final y = (errorCode >> 4) & 0xF; // Upper nibble - Motor/MOSFET status
+    final z = errorCode & 0xF;        // Lower nibble - Sensor status
+    
+    String motorStatus = _getMotorStatus(y);
+    String sensorStatus = _getSensorStatus(z);
+    
+    return '$motorStatus; $sensorStatus';
+  }
+  
+  String _getMotorStatus(int y) {
+    switch (y) {
+      case 0: return 'Motor and MOSFET normal';
+      case 1: return 'PMOS short circuit';
+      case 2: return 'NMOS short circuit';
+      case 3: return 'Motor short circuit';
+      case 4: return 'Motor open circuit';
+      case 5: return 'Motor rotation timeout';
+      default: return 'Unknown motor error ($y)';
     }
   }
   
-  /// Handle valid VMC response
-  void _handleValidResponse(VMCResponse response) {
-    print('Received valid response: $response');
-    
-    // Cancel timeout timer
-    _responseTimeout?.cancel();
-    
-    // Complete pending response if any
-    if (_pendingResponse != null && !_pendingResponse!.isCompleted) {
-      _pendingResponse!.complete(response);
-      _pendingResponse = null;
-    }
-    
-    // Broadcast to stream listeners
-    _responseController.add(response);
-  }
-  
-  /// Handle connection errors
-  void _handleConnectionError() {
-    _cancelPendingResponse();
-  }
-  
-  /// Cancel pending response with timeout
-  void _cancelPendingResponse() {
-    _responseTimeout?.cancel();
-    if (_pendingResponse != null && !_pendingResponse!.isCompleted) {
-      _pendingResponse!.completeError(
-        TimeoutException('Response timeout', const Duration(seconds: 5))
-      );
-      _pendingResponse = null;
+  String _getSensorStatus(int z) {
+    switch (z) {
+      case 0: return 'Drop sensor normal';
+      case 1: return 'Signal output when no emission in drop sensor';
+      case 2: return 'No signal output when drop sensor disabled';
+      case 3: return 'Signal output when product passing through drop sensor';
+      default: return 'Unknown sensor error ($z)';
     }
   }
   
-  /// Send command to VMC and wait for response
-  Future<VMCResponse> sendCommand(VMCCommand command) async {
-    if (!isConnected) {
-      throw Exception('Not connected to any device');
-    }
-    
-    if (_pendingResponse != null) {
-      throw Exception('Another command is in progress');
-    }
-    
-    try {
-      // Generate command frame
-      final commandBytes = command.generateFrame();
-      print('Sending command: ${commandBytes.map((b) => '0x${b.toRadixString(16).padLeft(2, '0').toUpperCase()}').join(' ')}');
-      
-      // Setup response handling
-      _pendingResponse = Completer<VMCResponse>();
-      
-      // Setup timeout
-      _responseTimeout = Timer(command.timeout, () {
-        _cancelPendingResponse();
-      });
-      
-      // Send command via socket
-      _socket?.add(commandBytes);
-      
-      // Wait for response
-      return await _pendingResponse!.future;
-      
-    } catch (e) {
-      _cancelPendingResponse();
-      rethrow;
-    }
+  @override
+  String toString() {
+    return 'VMCResponse(board: $driverBoardNumber, success: $isSuccess, '
+           'error: 0x${errorCode.toRadixString(16).padLeft(2, '0').toUpperCase()}, '
+           'product: ${hasProductDelivery ? 'delivered' : 'none'}, '
+           'checksum: ${isChecksumValid ? 'valid' : 'invalid'})';
+  }
+}
+
+/// Dispense command implementation
+class DispenseCommand extends VMCCommand {
+  final int slotNumber;
+  final bool useDropSensor;
+  
+  const DispenseCommand({
+    required super.driverBoardNumber,
+    required this.slotNumber,
+    this.useDropSensor = true,
+  });
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && 
+           driverBoardNumber <= 255 && 
+           slotNumber >= 1 && 
+           slotNumber <= 80;
   }
   
-  /// High-level command methods (same as previous implementation)
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid dispense command parameters');
+    }
+    
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = slotNumber; // 0x01-0x50 for slots 1-80
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = useDropSensor ? VMCProtocol.withDropSensor : VMCProtocol.withoutDropSensor;
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
   
-  /// Dispense product from specified slot
-  Future<VMCResponse> dispenseProduct({
-    required int driverBoardNumber,
-    required int slotNumber,
-    bool useDropSensor = true,
-  }) async {
-    final command = DispenseCommand(
-      driverBoardNumber: driverBoardNumber,
-      slotNumber: slotNumber,
-      useDropSensor: useDropSensor,
+  @override
+  Duration get timeout => const Duration(seconds: 10); // Dispensing may take longer
+}
+
+/// Self-check command implementation
+class SelfCheckCommand extends VMCCommand {
+  final bool checkDropSensor;
+  
+  const SelfCheckCommand({
+    required super.driverBoardNumber,
+    this.checkDropSensor = true,
+  });
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && driverBoardNumber <= 255;
+  }
+  
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid self-check command parameters');
+    }
+    
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = VMCProtocol.cmdSelfCheck;
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = checkDropSensor ? VMCProtocol.withDropSensor : VMCProtocol.withoutDropSensor;
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
+}
+
+/// Temperature reading command
+class ReadTemperatureCommand extends VMCCommand {
+  const ReadTemperatureCommand({required super.driverBoardNumber});
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && driverBoardNumber <= 255;
+  }
+  
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid temperature read command parameters');
+    }
+    
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = VMCProtocol.cmdReadTemperature;
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = 0x55; // Standard parameter for read operations
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
+}
+
+/// Temperature control command
+class TemperatureControlCommand extends VMCCommand {
+  final bool enableControl;
+  final bool coolingMode;
+  final int targetTemperature;
+  
+  const TemperatureControlCommand({
+    required super.driverBoardNumber,
+    required this.enableControl,
+    required this.coolingMode,
+    required this.targetTemperature,
+  });
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && 
+           driverBoardNumber <= 255 && 
+           targetTemperature >= -50 && 
+           targetTemperature <= 100;
+  }
+  
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid temperature control command parameters');
+    }
+    
+    // This is a composite command that sends multiple frames
+    // For simplicity, returning the enable/disable control frame
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = VMCProtocol.cmdTemperatureControl;
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = enableControl ? VMCProtocol.tempControlEnabled : VMCProtocol.tempControlDisabled;
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
+}
+
+/// Set target temperature command
+class SetTargetTemperatureCommand extends VMCCommand {
+  final int temperature;
+  
+  const SetTargetTemperatureCommand({
+    required super.driverBoardNumber,
+    required this.temperature,
+  });
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && 
+           driverBoardNumber <= 255 && 
+           temperature >= -50 && 
+           temperature <= 100;
+  }
+  
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid set temperature command parameters');
+    }
+    
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = VMCProtocol.cmdSetTargetTemperature;
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = temperature & 0xFF; // Convert to unsigned byte
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
+}
+
+/// Lighting control command
+class LightingControlCommand extends VMCCommand {
+  final bool turnOn;
+  
+  const LightingControlCommand({
+    required super.driverBoardNumber,
+    required this.turnOn,
+  });
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && driverBoardNumber <= 255;
+  }
+  
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid lighting control command parameters');
+    }
+    
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = VMCProtocol.cmdLightingControl;
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = turnOn ? VMCProtocol.lightOn : VMCProtocol.lightOff;
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
+}
+
+/// Door status command
+class DoorStatusCommand extends VMCCommand {
+  const DoorStatusCommand({required super.driverBoardNumber});
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && driverBoardNumber <= 255;
+  }
+  
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid door status command parameters');
+    }
+    
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = VMCProtocol.cmdDoorStatus;
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = 0x55; // Standard parameter for read operations
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
+}
+
+/// Slot mode setting command
+class SetSlotModeCommand extends VMCCommand {
+  final int slotNumber;
+  final bool isBeltMode; // true for belt, false for spiral
+  
+  const SetSlotModeCommand({
+    required super.driverBoardNumber,
+    required this.slotNumber,
+    required this.isBeltMode,
+  });
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && 
+           driverBoardNumber <= 255 && 
+           slotNumber >= 1 && 
+           slotNumber <= 80;
+  }
+  
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid slot mode command parameters');
+    }
+    
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = isBeltMode ? VMCProtocol.cmdSetBeltSlot : VMCProtocol.cmdSetSpiralSlot;
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = slotNumber;
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
+}
+
+/// Slot merge/split command
+class SlotMergeCommand extends VMCCommand {
+  final int slotNumber;
+  final bool isDualSlot; // true for dual, false for single
+  
+  const SlotMergeCommand({
+    required super.driverBoardNumber,
+    required this.slotNumber,
+    required this.isDualSlot,
+  });
+  
+  @override
+  bool validate() {
+    return driverBoardNumber >= 0 && 
+           driverBoardNumber <= 255 && 
+           slotNumber >= 1 && 
+           slotNumber <= 80;
+  }
+  
+  @override
+  Uint8List generateFrame() {
+    if (!validate()) {
+      throw ArgumentError('Invalid slot merge command parameters');
+    }
+    
+    final d1 = driverBoardNumber;
+    final d2 = (0xFF - d1) & 0xFF;
+    final d3 = isDualSlot ? VMCProtocol.cmdSetDualSlot : VMCProtocol.cmdSetSingleSlot;
+    final d4 = (0xFF - d3) & 0xFF;
+    final d5 = slotNumber;
+    final d6 = (0xFF - d5) & 0xFF;
+    
+    return Uint8List.fromList([d1, d2, d3, d4, d5, d6]);
+  }
+}
+
+/// Temperature response data
+class TemperatureData {
+  final int currentTemperature;
+  final int standbyTemperature;
+  
+  const TemperatureData({
+    required this.currentTemperature,
+    required this.standbyTemperature,
+  });
+  
+  factory TemperatureData.fromResponse(VMCResponse response) {
+    return TemperatureData(
+      currentTemperature: response.errorCode, // R3 contains current temperature
+      standbyTemperature: response.productFlag, // R4 contains standby temperature
     );
-    
-    return await sendCommand(command);
   }
   
-  /// Perform self-check on the driver board
-  Future<VMCResponse> performSelfCheck({
-    required int driverBoardNumber,
-    bool checkDropSensor = true,
-  }) async {
-    final command = SelfCheckCommand(
-      driverBoardNumber: driverBoardNumber,
-      checkDropSensor: checkDropSensor,
-    );
-    
-    return await sendCommand(command);
+  @override
+  String toString() {
+    return 'Temperature: ${currentTemperature}°C, Standby: ${standbyTemperature}°C';
+  }
+}
+
+/// Door status data
+class DoorStatusData {
+  final bool isOpen;
+  
+  const DoorStatusData({required this.isOpen});
+  
+  factory DoorStatusData.fromResponse(VMCResponse response) {
+    return DoorStatusData(isOpen: response.errorCode == 0x01);
   }
   
-  /// Read current temperature from VMC
-  Future<TemperatureData> readTemperature({
-    required int driverBoardNumber,
-  }) async {
-    final command = ReadTemperatureCommand(driverBoardNumber: driverBoardNumber);
-    final response = await sendCommand(command);
-    
-    if (!response.isSuccess) {
-      throw Exception('Failed to read temperature: ${response.errorDescription}');
-    }
-    
-    return TemperatureData.fromResponse(response);
-  }
-  
-  /// Set temperature control parameters
-  Future<VMCResponse> setTemperatureControl({
-    required int driverBoardNumber,
-    required bool enableControl,
-    required bool coolingMode,
-    required int targetTemperature,
-  }) async {
-    // Send temperature control enable/disable command
-    var command = TemperatureControlCommand(
-      driverBoardNumber: driverBoardNumber,
-      enableControl: enableControl,
-      coolingMode: coolingMode,
-      targetTemperature: targetTemperature,
-    );
-    
-    var response = await sendCommand(command);
-    if (!response.isSuccess) return response;
-    
-    // Small delay between commands
-    await Future.delayed(const Duration(milliseconds: 100));
-    
-    // Send target temperature command
-    final tempCommand = SetTargetTemperatureCommand(
-      driverBoardNumber: driverBoardNumber,
-      temperature: targetTemperature,
-    );
-    
-    return await sendCommand(tempCommand);
-  }
-  
-  /// Control lighting
-  Future<VMCResponse> controlLighting({
-    required int driverBoardNumber,
-    required bool turnOn,
-  }) async {
-    final command = LightingControlCommand(
-      driverBoardNumber: driverBoardNumber,
-      turnOn: turnOn,
-    );
-    
-    return await sendCommand(command);
-  }
-  
-  /// Read door status
-  Future<DoorStatusData> readDoorStatus({
-    required int driverBoardNumber,
-  }) async {
-    final command = DoorStatusCommand(driverBoardNumber: driverBoardNumber);
-    final response = await sendCommand(command);
-    
-    if (!response.isSuccess) {
-      throw Exception('Failed to read door status: ${response.errorDescription}');
-    }
-    
-    return DoorStatusData.fromResponse(response);
-  }
-  
-  /// Set slot mode (belt/spiral)
-  Future<VMCResponse> setSlotMode({
-    required int driverBoardNumber,
-    required int slotNumber,
-    required bool isBeltMode,
-  }) async {
-    final command = SetSlotModeCommand(
-      driverBoardNumber: driverBoardNumber,
-      slotNumber: slotNumber,
-      isBeltMode: isBeltMode,
-    );
-    
-    return await sendCommand(command);
-  }
-  
-  /// Merge or split slots
-  Future<VMCResponse> setSlotMerge({
-    required int driverBoardNumber,
-    required int slotNumber,
-    required bool isDualSlot,
-  }) async {
-    final command = SlotMergeCommand(
-      driverBoardNumber: driverBoardNumber,
-      slotNumber: slotNumber,
-      isDualSlot: isDualSlot,
-    );
-    
-    return await sendCommand(command);
-  }
-  
-  /// Check if Bluetooth is available and enabled
-  Future<bool> isBluetoothAvailable() async {
-    // Platform-specific implementation would go here
-    return true; // Simplified for demo
-  }
-  
-  /// Enable Bluetooth if disabled
-  Future<bool> enableBluetooth() async {
-    // Platform-specific implementation would go here
-    return true; // Simplified for demo
-  }
-  
-  /// Get current connection info
-  Map<String, dynamic> getConnectionInfo() {
-    return {
-      'isConnected': isConnected,
-      'deviceName': _connectedDeviceName,
-      'deviceAddress': _connectedDeviceAddress,
-      'bufferSize': _buffer.length,
-      'hasPendingResponse': _pendingResponse != null,
-    };
-  }
-  
-  /// Clear the input buffer
-  void clearBuffer() {
-    _buffer.clear();
-  }
-  
-  void dispose() {
-    disconnect();
-    _responseController.close();
+  @override
+  String toString() {
+    return 'Door is ${isOpen ? 'OPEN' : 'CLOSED'}';
   }
 }
 
@@ -446,4 +519,14 @@ class BluetoothDeviceInfo {
   String toString() {
     return 'BluetoothDevice(name: $name, address: $address, connected: $isConnected)';
   }
+  
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BluetoothDeviceInfo &&
+          runtimeType == other.runtimeType &&
+          address == other.address;
+  
+  @override
+  int get hashCode => address.hashCode;
 }

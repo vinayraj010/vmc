@@ -22,11 +22,11 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
     private var isConnected = false
+    private var listenThread: Thread? = null
     
     companion object {
         private const val CHANNEL = "vmc_bluetooth"
         private const val TAG = "VMC_Bluetooth"
-        // Standard RFCOMM UUID for SPP (Serial Port Profile)
         private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
     }
 
@@ -35,6 +35,7 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
         channel.setMethodCallHandler(this)
         
         bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+        Log.d(TAG, "BluetoothManager attached to engine")
     }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
@@ -85,20 +86,29 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
 
     private fun getPairedDevices(result: Result) {
         try {
+            if (bluetoothAdapter == null) {
+                result.error("BLUETOOTH_UNAVAILABLE", "Bluetooth adapter not available", null)
+                return
+            }
+            
             val pairedDevices = bluetoothAdapter?.bondedDevices
             val deviceList = mutableListOf<Map<String, Any>>()
             
             pairedDevices?.forEach { device ->
-                deviceList.add(
-                    mapOf(
-                        "name" to (device.name ?: "Unknown"),
-                        "address" to device.address,
-                        "isConnected" to false
-                    )
+                val deviceInfo = mapOf(
+                    "name" to (device.name ?: "Unknown Device"),
+                    "address" to device.address,
+                    "isConnected" to false
                 )
+                deviceList.add(deviceInfo)
+                Log.d(TAG, "Found paired device: ${device.name} - ${device.address}")
             }
             
             result.success(deviceList)
+            Log.d(TAG, "Returned ${deviceList.size} paired devices")
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception getting paired devices", e)
+            result.error("PERMISSION_DENIED", "Bluetooth permission denied: ${e.message}", null)
         } catch (e: Exception) {
             Log.e(TAG, "Error getting paired devices", e)
             result.error("BLUETOOTH_ERROR", "Failed to get paired devices: ${e.message}", null)
@@ -108,40 +118,47 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
     private fun connectToDevice(address: String, result: Result) {
         Thread {
             try {
-                // Disconnect any existing connection
+                Log.d(TAG, "Attempting to connect to device: $address")
+                
                 disconnect()
                 
-                val device: BluetoothDevice? = bluetoothAdapter?.getRemoteDevice(address)
-                if (device == null) {
-                    result.error("DEVICE_NOT_FOUND", "Device not found", null)
+                if (bluetoothAdapter == null) {
+                    result.error("BLUETOOTH_UNAVAILABLE", "Bluetooth adapter not available", null)
                     return@Thread
                 }
                 
-                // Create RFCOMM socket
+                val device: BluetoothDevice? = bluetoothAdapter?.getRemoteDevice(address)
+                if (device == null) {
+                    result.error("DEVICE_NOT_FOUND", "Device not found: $address", null)
+                    return@Thread
+                }
+                
+                Log.d(TAG, "Creating RFCOMM socket to device: ${device.name}")
+                
                 bluetoothSocket = device.createRfcommSocketToServiceRecord(SPP_UUID)
                 
-                // Cancel discovery to improve connection performance
                 bluetoothAdapter?.cancelDiscovery()
                 
-                // Connect to the device
                 bluetoothSocket?.connect()
                 
-                // Get input and output streams
                 inputStream = bluetoothSocket?.inputStream
                 outputStream = bluetoothSocket?.outputStream
                 
                 isConnected = true
                 
-                // Start listening for incoming data
                 startListening()
                 
                 result.success(true)
-                Log.d(TAG, "Connected to device: $address")
+                Log.d(TAG, "Successfully connected to device: $address")
                 
             } catch (e: IOException) {
-                Log.e(TAG, "Connection failed", e)
+                Log.e(TAG, "Connection failed to $address", e)
                 disconnect()
                 result.error("CONNECTION_FAILED", "Failed to connect: ${e.message}", null)
+            } catch (e: SecurityException) {
+                Log.e(TAG, "Security exception during connection", e)
+                disconnect()
+                result.error("PERMISSION_DENIED", "Bluetooth permission denied: ${e.message}", null)
             } catch (e: Exception) {
                 Log.e(TAG, "Unexpected error during connection", e)
                 disconnect()
@@ -151,8 +168,10 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
     }
 
     private fun startListening() {
-        Thread {
+        listenThread = Thread {
             val buffer = ByteArray(1024)
+            
+            Log.d(TAG, "Started listening for incoming data")
             
             while (isConnected && inputStream != null) {
                 try {
@@ -160,22 +179,22 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
                     if (bytesRead > 0) {
                         val data = buffer.copyOf(bytesRead)
                         
-                        // Send data back to Flutter
                         channel.invokeMethod("onDataReceived", data)
                         
-                        Log.d(TAG, "Received ${bytesRead} bytes")
+                        Log.d(TAG, "Received ${bytesRead} bytes: ${data.joinToString(" ") { "0x%02x".format(it) }}")
                     }
                 } catch (e: IOException) {
                     Log.e(TAG, "Error reading from input stream", e)
                     if (isConnected) {
-                        // Connection lost
                         disconnect()
                         channel.invokeMethod("onConnectionLost", null)
                     }
                     break
                 }
             }
-        }.start()
+            Log.d(TAG, "Stopped listening for incoming data")
+        }
+        listenThread?.start()
     }
 
     private fun sendData(data: ByteArray, result: Result) {
@@ -189,7 +208,7 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
                 outputStream?.write(data)
                 outputStream?.flush()
                 result.success(true)
-                Log.d(TAG, "Sent ${data.size} bytes")
+                Log.d(TAG, "Sent ${data.size} bytes: ${data.joinToString(" ") { "0x%02x".format(it) }}")
             } catch (e: IOException) {
                 Log.e(TAG, "Error sending data", e)
                 result.error("SEND_FAILED", "Failed to send data: ${e.message}", null)
@@ -199,7 +218,11 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
 
     private fun disconnect(result: Result? = null) {
         try {
+            Log.d(TAG, "Disconnecting from device")
+            
             isConnected = false
+            
+            listenThread?.interrupt()
             
             inputStream?.close()
             outputStream?.close()
@@ -208,9 +231,10 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
             inputStream = null
             outputStream = null
             bluetoothSocket = null
+            listenThread = null
             
             result?.success(true)
-            Log.d(TAG, "Disconnected from device")
+            Log.d(TAG, "Successfully disconnected from device")
             
         } catch (e: IOException) {
             Log.e(TAG, "Error during disconnect", e)
@@ -221,5 +245,6 @@ class BluetoothManager : FlutterPlugin, MethodCallHandler {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
         disconnect()
+        Log.d(TAG, "BluetoothManager detached from engine")
     }
 }
